@@ -252,8 +252,9 @@ def render_amd_atomic_fetch_add(ctx, x:UOp, f:UOp) -> str|None:
             "__hip_atomic_fetch_add({0}, {1}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);": 'syncscope("agent") '}
   if not f.arg.fmt or f.arg.code not in scopes or len(x.src) != 3: return None
   idx, val = x.src[1:]
-  if idx.dtype != val.dtype or not (val.dtype in dtypes.floats or val.dtype in dtypes.ints): return None
-  op = "fadd" if val.dtype in dtypes.floats else "add"
+  atomic_floats = (dtypes.float16, dtypes.bfloat16, dtypes.float32, dtypes.float64)
+  if idx.dtype != val.dtype or not (val.dtype in atomic_floats or val.dtype in dtypes.ints): return None
+  op = "fadd" if val.dtype in atomic_floats else "add"
   scope = scopes[f.arg.code]
   ins = f"atomicrmw {op} {ldt(idx.dtype, ptr=True)} {ctx[idx]}, {ldt(val.dtype)} {ctx[val]}"
   return f"  {ctx[x]} = {ins} {scope}monotonic, align {idx.dtype.itemsize}"
