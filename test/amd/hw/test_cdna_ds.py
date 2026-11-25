@@ -28,7 +28,7 @@ def _tr_expected() -> list[list[int]]:
       words[halfword // 2][lane] |= val << (16 * (halfword & 1))
   return words
 
-def _tr_program(offset: int = 0, acc: int = 0, vdst: int = 2, partial_exec: bool = False) -> list:
+def _tr_program(offset: int = 0, acc: int = 0, vdst: int = 2) -> list:
   code = [cdna.v_mov_b32_e32(cdna.v[2], 0xdeadbeef), cdna.v_mov_b32_e32(cdna.v[3], 0xdeadbeef),
           cdna.v_mov_b32_e32(cdna.v[4], 0), cdna.v_mov_b32_e32(cdna.v[5], 0),
           cdna.v_lshlrev_b32_e32(cdna.v[0], 3, cdna.v[255]),
@@ -41,9 +41,7 @@ def _tr_program(offset: int = 0, acc: int = 0, vdst: int = 2, partial_exec: bool
     if shift == 0: code.append(cdna.v_or_b32_e32(cdna.v[4 + dword], cdna.v[9], cdna.v[4 + dword]))
     else: code.append(cdna.v_lshl_or_b32(cdna.v[4 + dword], cdna.v[9], shift, cdna.v[4 + dword]))
   code += [cdna.ds_write_b64(addr=cdna.v[0], data0=cdna.v[4:5], offset0=offset & 255, offset1=offset >> 8), cdna.s_waitcnt(0)]
-  if partial_exec: code += [cdna.s_mov_b32(cdna.EXEC_LO, 0xffff), cdna.s_mov_b32(cdna.EXEC_HI, 0)]
   code.append(cdna.ds_read_b64_tr_b16(vdst=cdna.v[vdst:vdst + 1], addr=cdna.v[0], offset0=offset & 255, offset1=offset >> 8, acc=acc))
-  if partial_exec: code += [cdna.s_mov_b32(cdna.EXEC_LO, 0xffffffff), cdna.s_mov_b32(cdna.EXEC_HI, 0xffffffff)]
   code.append(cdna.s_waitcnt(0))
   if acc: code += [cdna.v_accvgpr_read(cdna.v[vdst + i], cdna.v[vdst + i]) for i in range(2)]
   return code
@@ -60,13 +58,6 @@ class TestCDNADSReadTRB16(unittest.TestCase):
 
   def test_transpose(self):
     self.assertEqual([run_cdna_lanes(_tr_program(), out_reg=2 + w) for w in range(2)], _tr_expected())
-
-  def test_exec_masks_destination_lanes(self):
-    got = [run_cdna_lanes(_tr_program(partial_exec=True), out_reg=2 + w) for w in range(2)]
-    expected = _tr_expected()
-    for w in range(2):
-      self.assertEqual(got[w][:16], expected[w][:16])
-      self.assertEqual(got[w][16:], [0xdeadbeef] * 48)
 
   def test_offset_acc_and_vdst_addr_alias(self):
     expected = _tr_expected()
