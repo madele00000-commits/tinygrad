@@ -66,7 +66,7 @@ from tinygrad.runtime.autogen.amd.cdna.str_pcode import PCODE as PCODE_CDNA
 from tinygrad.runtime.autogen.amd.rdna3 import ins as ir3
 from tinygrad.runtime.autogen.amd.rdna4 import ins as ir4
 from tinygrad.runtime.autogen.amd.cdna import ins as irc
-from tinygrad.renderer.amd.dsl import VCC_LO, EXEC_LO, SCC, ttmp, Inst
+from tinygrad.renderer.amd.dsl import VCC_LO, EXEC_LO, SCC, ttmp, Inst, Reg
 from tinygrad.runtime.autogen.amd.common import Fmt, OpType
 from test.amd.helpers import decode_dpp16
 from test.mockgpu.amd.pcode import parse_pcode, _FUNCS, _set_bits, _to_bool, _to_u32, _val_to_bits, _ftz_f32, _bitreverse, _countbits
@@ -1416,10 +1416,45 @@ def _compile_vopd(inst: ir3.VOPD | ir4.VOPD, ctx: _Ctx) -> UOp:
       if dest.startswith('D0'): all_stores.append(ctx.wvgpr_dyn(vdst_reg, lane, _val_to_u32(val), exec_mask, after=srcy1))
   return UOp.sink(UOp.group(*all_stores).end(lane))
 
+def _compile_ds_read_b64_tr_b16(inst: irc.DS, ctx: _Ctx) -> UOp:
+  """CDNA4 DS_READ_B64_TR_B16. This op has no pcode; within each 16-lane group it transposes four halfwords per lane.
+
+  Hardware-verified lane map: destination lane l, halfword n comes from source lane
+  ((l & ~0xf) | ((l >> 2) & 3)) + 4*n, halfword l & 3.
+  """
+  exec_mask = ctx.rexec()
+  addr_reg, vdst_reg = ctx.inst_field(type(inst).addr), ctx.inst_field(type(inst).vdst)
+  offset = (ctx.inst_field(type(inst).offset1) << _c(8)) | ctx.inst_field(type(inst).offset0)
+  write = ctx.waccvgpr_dyn if _iattr(inst, 'acc') else ctx.wvgpr_dyn
+
+  # vdst may overlap the address register. Snapshot every lane's address before writing any outputs.
+  snap_lane = ctx.range()
+  addr_snapshot = UOp.alloc((ctx.wave_size,), dtypes.uint32, 0, AddrSpace.REG)
+  snapshot_phase = addr_snapshot.index(snap_lane).store(ctx.rvgpr_dyn(addr_reg, snap_lane)).end(snap_lane)
+
+  lane = ctx.range()
+  group, tx = lane // _c(16, dtypes.int), lane % _c(16, dtypes.int)
+  addrs = addr_snapshot.after(snapshot_phase)
+  dwords = []
+  for w in range(2):
+    out = _c(0)
+    for half in range(2):
+      row = w * 2 + half
+      reader = group * _c(16, dtypes.int) + _c(row * 4, dtypes.int) + tx // _c(4, dtypes.int)
+      elem = (tx % _c(4, dtypes.int)).cast(dtypes.uint32)
+      byte_addr = (addrs.index(reader).load() + offset).cast(dtypes.uint32) + elem * _c(2)
+      word, shift = byte_addr >> _c(2), (byte_addr & _c(3)) << _c(3)
+      val = (ctx.lds.index(word).load() >> shift) & _c(0xffff)
+      out = out | (val << _c(16 * half))
+    dwords.append(out)
+  stores = [write(vdst_reg + _c(w), lane, dwords[w], exec_mask) for w in range(2)]
+  return UOp.sink(snapshot_phase, UOp.group(*stores).end(lane))
+
 def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLAT|ir4.VGLOBAL|ir4.VSCRATCH
                     |irc.DS|irc.FLAT|irc.GLOBAL|irc.SCRATCH, ctx: _Ctx) -> UOp:
   """Unified memory operation compiler for DS, FLAT, GLOBAL, SCRATCH."""
   exec_mask, op_name = ctx.rexec(), _op_name(inst)
+  if isinstance(inst, irc.DS) and op_name == 'DS_READ_B64_TR_B16': return _compile_ds_read_b64_tr_b16(inst, ctx)
   pcode = get_pcode(inst.op)
   # CDNA and RDNA4 FLAT/SCRATCH pcode compute addresses from raw components, but make_addr already handles this.
   # Strip the addr computation line and use pre-computed ADDR directly (rename 'addr' -> 'ADDR' in remaining pcode).
@@ -1839,6 +1874,34 @@ def cfg_regions(paths:dict[int, dict[int, int]], entry:int) -> list[CFGRegion]:
     return regions
   return build(set(order))
 
+def ds_deferred(insts:list[Inst]) -> dict[int, int]:
+  """CDNA DS loads whose destinations are reused as later DS operands before their data becomes visible.
+
+  Returns {load index: commit index}. Handwritten kernels may reuse one read's destination as the next read's address before
+  s_waitcnt; hardware still uses the old address until the waitcnt that commits the first result.
+  """
+  commit:dict[int, int] = {}
+  pending:list[int] = []
+  for i, inst in enumerate(insts):
+    if isinstance(inst, irc.SOPP) and inst.op is irc.SOPPOp.S_WAITCNT:
+      # lgkmcnt is bits 11:8 of simm16. LDS/GDS/SMEM operations complete in issue order.
+      while len(pending) > ((inst.simm16 >> 8) & 0xf): commit[pending.pop(0)] = i
+    if isinstance(inst, (irc.DS, irc.SMEM)): pending.append(i)
+  commit.update((i, len(insts)) for i in pending)
+
+  def vgprs(inst:Inst, *names:str) -> set[int]:
+    return {r.offset+k for n, cnt in inst.op_regs.items() if (not names or n in names) and isinstance(r:=getattr(inst, n, None), Reg)
+            and r.offset >= 256 for k in range(cnt)}
+  ret:dict[int, int] = {}
+  for i, c in commit.items():
+    if not (dst:=vgprs(insts[i], 'vdst')): continue
+    # Only input operands are uses. Treating a later vdst as a use would reverse the in-order result of two loads
+    # writing the same destination.
+    users = [j for j in range(i+1, c) if dst & vgprs(insts[j], 'addr', 'data0', 'data1')]
+    # This models the handwritten back-to-back DS pattern. A non-DS consumer without waitcnt remains outside this narrow model.
+    if (ds_users:=list(itertools.takewhile(lambda j: isinstance(insts[j], irc.DS), users))): ret[i] = ds_users[-1]+1
+  return ret
+
 RENDER = ContextVar("RENDER", 0) # render lifted ast back to assembly
 
 def linearize_basic_block(call:UOp):
@@ -1898,6 +1961,22 @@ def lift(code:bytes, arch:str, renderer:Renderer, dispatch:tuple, name:str="") -
   buffers = {ctx.sgpr:(sgpr, SGPR_COUNT), ctx.vgpr:(vgpr, 256*wave_size), ctx.vmem:(ctx.vmem, 0),
              ctx.lds:(lds, 0), ctx.scratch:(scratch, scratch_size*wave_size)}
   if wave_size == 64: buffers[ctx.accvgpr] = (accvgpr, 256*wave_size)
+
+  # Deferred CDNA DS load results. Each slot reserves four old and four new dwords, enough for any DS return width.
+  deferred_blocks:dict[int, dict[int, int]] = {}
+  ds_slots = 0
+  if wave_size == 64:
+    for pc, offs in cfg["blocks"].items():
+      deferred = ds_deferred([insts[off] for off in offs])
+      if deferred: deferred_blocks[pc] = deferred
+      ds_slots = max(ds_slots, len(deferred))
+  ds_regs = max(1, ds_slots * 8)
+  ds_ret = UOp.param(10, dtypes.uint32, ds_regs*wave_size, name="ds_ret")
+  buffers[ds_ret] = (UOp.alloc((n_waves*ds_regs*wave_size,), dtypes.uint32, 8, AddrSpace.REG), ds_regs*wave_size)
+  def ds_copy(dst:UOp, dst_reg:int, src:UOp, src_reg:int, n:int) -> UOp:
+    i = UOp.range(n*wave_size, 0, dtype=dtypes.int)
+    return lower_body(dst.index(i+dst_reg*wave_size).store(src.index(i+src_reg*wave_size).load()).end(i).sink(arg=KernelInfo("ds_return")))
+
   routes = UOp.alloc((n_waves,), dtypes.int, 6, AddrSpace.REG)
   active = UOp.alloc((1,), dtypes.bool, 7, AddrSpace.REG)
   route = UOp.param(6, dtypes.int, (1,), name="route")
@@ -1930,10 +2009,24 @@ def lift(code:bytes, arch:str, renderer:Renderer, dispatch:tuple, name:str="") -
   def emit_block(block_pc:int, end:UOp, scopes:tuple[UOp, ...]) -> UOp:
     cond = UOp.const(True)
     instructions = []
-    for off in cfg["blocks"][block_pc]:
-      call, branch_cond = instruction_call(insts[off], arch, renderer)
+    block = [insts[off] for off in cfg["blocks"][block_pc]]
+    # Save the old destination before a deferred load, restore it after the load, then commit the new data after all
+    # back-to-back DS instructions that must still read the old value. This preserves their operand snapshot semantics.
+    pre:dict[int, list[UOp]] = {}
+    post:dict[int, list[UOp]] = {}
+    commits:dict[int, list[UOp]] = {}
+    for slot, (i, c) in enumerate(sorted(deferred_blocks.get(block_pc, {}).items())):
+      gpr, slot_reg = (ctx.accvgpr if _iattr(block[i], 'acc') else ctx.vgpr), slot * 8
+      reg, n = getattr(block[i], 'vdst').offset - 256, block[i].op_regs['vdst']
+      pre[i] = [ds_copy(ds_ret, slot_reg, gpr, reg, n)]
+      post[i] = [ds_copy(ds_ret, slot_reg+4, gpr, reg, n), ds_copy(gpr, reg, ds_ret, slot_reg, n)]
+      commits.setdefault(c, []).append(ds_copy(gpr, reg, ds_ret, slot_reg+4, n))
+    for i, inst in enumerate(block):
+      instructions.extend(commits.pop(i, []))
+      call, branch_cond = instruction_call(inst, arch, renderer)
       if branch_cond is not None: cond = branch_cond
-      if call is not None: instructions.append(call)
+      if call is not None: instructions.extend([*pre.get(i, []), call, *post.get(i, [])])
+    instructions.extend(commits.pop(len(block), []))
     values = {ctx.scratch_stride:_c(scratch_size)}
     if routed:
       dsts = {kind:dst for dst,kind in cfg["paths"][block_pc].items()}
