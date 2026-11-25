@@ -3,6 +3,7 @@ from dataclasses import replace
 from test.mockgpu.gpu import VirtGPU
 from tinygrad.helpers import getbits, to_mv, getenv, DEV
 from tinygrad.runtime.support import c
+from tinygrad.runtime.autogen import hsa
 
 MOCKGPU_ARCH = "cdna4" if DEV.arch == "gfx950" else "rdna4" if DEV.arch.startswith("gfx12") else "rdna3"
 assert (ma:=getenv("MOCKGPU_ARCH", "")) == "", "MOCKGPU_ARCH is deprecated, use DEV=" + \
@@ -190,9 +191,15 @@ class PM4Executor(AMDQueue):
     _ = self._next_dword() # flags
 
     prg_addr = (self.gpu.regs[regCOMPUTE_PGM_LO] + (self.gpu.regs[regCOMPUTE_PGM_LO + 1] << 32)) << 8
-    args_addr = self.gpu.regs[regCOMPUTE_USER_DATA_0] + (self.gpu.regs[regCOMPUTE_USER_DATA_0 + 1] << 32)
     lc = [self.gpu.regs[i] for i in range(regCOMPUTE_NUM_THREAD_X, regCOMPUTE_NUM_THREAD_X+3)]
     rsrc2 = self.gpu.regs[regCOMPUTE_PGM_RSRC2]
+    user_sgpr_count = (rsrc2 & hsa.AMD_COMPUTE_PGM_RSRC_TWO_USER_SGPR_COUNT) >> hsa.AMD_COMPUTE_PGM_RSRC_TWO_USER_SGPR_COUNT_SHIFT
+    user_data = []
+    for i in range(user_sgpr_count):
+      try: user_data.append(self.gpu.regs[regCOMPUTE_USER_DATA_0+i])
+      except KeyError: user_data.append(0)
+    # the kernarg pointer is the last user SGPR pair; legacy handwritten kernels pass it as args_ptr
+    args_addr = user_data[-2] + (user_data[-1] << 32) if len(user_data) >= 2 else 0
 
     prg_sz = 0
     for st,sz in sorted(self.gpu.mapped_ranges):
@@ -210,7 +217,7 @@ class PM4Executor(AMDQueue):
     assert 0 < self.kernel_text_size <= prg_sz, "Invalid prg ptr or text size"
     from test.mockgpu.amd.emu import run_asm
     err = run_asm(prg_addr, self.kernel_text_size, gl[0], gl[1], gl[2], lc[0], lc[1], lc[2], args_addr,
-                  rsrc2, scratch_size, self.gpu.arch, self.kernel_name)
+                  rsrc2, scratch_size, self.gpu.arch, self.kernel_name, tuple(user_data))
     if err != 0: raise RuntimeError("remu does not support the new instruction introduced in this kernel")
 
   def _exec_indirect_buffer(self, n):
