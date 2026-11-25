@@ -1416,10 +1416,45 @@ def _compile_vopd(inst: ir3.VOPD | ir4.VOPD, ctx: _Ctx) -> UOp:
       if dest.startswith('D0'): all_stores.append(ctx.wvgpr_dyn(vdst_reg, lane, _val_to_u32(val), exec_mask, after=srcy1))
   return UOp.sink(UOp.group(*all_stores).end(lane))
 
+def _compile_ds_read_b64_tr_b16(inst: irc.DS, ctx: _Ctx) -> UOp:
+  """CDNA4 DS_READ_B64_TR_B16. This op has no pcode; within each 16-lane group it transposes four halfwords per lane.
+
+  Hardware-verified lane map: destination lane l, halfword n comes from source lane
+  ((l & ~0xf) | ((l >> 2) & 3)) + 4*n, halfword l & 3.
+  """
+  exec_mask = ctx.rexec()
+  addr_reg, vdst_reg = ctx.inst_field(type(inst).addr), ctx.inst_field(type(inst).vdst)
+  offset = (ctx.inst_field(type(inst).offset1) << _c(8)) | ctx.inst_field(type(inst).offset0)
+  write = ctx.waccvgpr_dyn if _iattr(inst, 'acc') else ctx.wvgpr_dyn
+
+  # vdst may overlap the address register. Snapshot every lane's address before writing any outputs.
+  snap_lane = ctx.range()
+  addr_snapshot = UOp.alloc((ctx.wave_size,), dtypes.uint32, 0, AddrSpace.REG)
+  snapshot_phase = addr_snapshot.index(snap_lane).store(ctx.rvgpr_dyn(addr_reg, snap_lane)).end(snap_lane)
+
+  lane = ctx.range()
+  group, tx = lane // _c(16, dtypes.int), lane % _c(16, dtypes.int)
+  addrs = addr_snapshot.after(snapshot_phase)
+  dwords = []
+  for w in range(2):
+    out = _c(0)
+    for half in range(2):
+      row = w * 2 + half
+      reader = group * _c(16, dtypes.int) + _c(row * 4, dtypes.int) + tx // _c(4, dtypes.int)
+      elem = (tx % _c(4, dtypes.int)).cast(dtypes.uint32)
+      byte_addr = (addrs.index(reader).load() + offset).cast(dtypes.uint32) + elem * _c(2)
+      word, shift = byte_addr >> _c(2), (byte_addr & _c(3)) << _c(3)
+      val = (ctx.lds.index(word).load() >> shift) & _c(0xffff)
+      out = out | (val << _c(16 * half))
+    dwords.append(out)
+  stores = [write(vdst_reg + _c(w), lane, dwords[w], exec_mask) for w in range(2)]
+  return UOp.sink(snapshot_phase, UOp.group(*stores).end(lane))
+
 def _compile_mem_op(inst: ir3.DS|ir3.FLAT|ir3.GLOBAL|ir3.SCRATCH|ir4.DS|ir4.VFLAT|ir4.VGLOBAL|ir4.VSCRATCH
                     |irc.DS|irc.FLAT|irc.GLOBAL|irc.SCRATCH, ctx: _Ctx) -> UOp:
   """Unified memory operation compiler for DS, FLAT, GLOBAL, SCRATCH."""
   exec_mask, op_name = ctx.rexec(), _op_name(inst)
+  if isinstance(inst, irc.DS) and op_name == 'DS_READ_B64_TR_B16': return _compile_ds_read_b64_tr_b16(inst, ctx)
   pcode = get_pcode(inst.op)
   # CDNA and RDNA4 FLAT/SCRATCH pcode compute addresses from raw components, but make_addr already handles this.
   # Strip the addr computation line and use pre-computed ADDR directly (rename 'addr' -> 'ADDR' in remaining pcode).
