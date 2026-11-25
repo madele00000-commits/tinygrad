@@ -105,7 +105,7 @@ def dispatch_packet(data:AMDProgramData, dims:tuple, kernel_object:UOp=UOp.const
   pkt = bytes(hsa.hsa_kernel_dispatch_packet_t(header=AQL_HDR | (hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE),
     setup=3 << hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS, private_segment_size=data.private_segment_size,
     group_segment_size=data.group_segment_size, **{f"workgroup_size_{d}": l for d, l in zip("xyz", local_size)}))
-  grid = [(g * l).cast(dtypes.uint32) if isinstance(g, UOp) else g * l for g, l in zip(global_size, local_size)]
+  grid = [(g * l).cast(dtypes.uint32) if isinstance(g, UOp) else UOp.const(g * l, dtypes.uint32) for g, l in zip(global_size, local_size)]
   return [UOp(Ops.BINARY, arg=pkt[:12]), *grid, UOp(Ops.BINARY, arg=pkt[24:32]), kernel_object, kernarg_address, UOp(Ops.BINARY, arg=pkt[48:])]
 
 class AMDComputeQueue(HWQueue):
