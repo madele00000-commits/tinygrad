@@ -1419,7 +1419,7 @@ def _compile_vopd(inst: ir3.VOPD | ir4.VOPD, ctx: _Ctx) -> UOp:
 def _compile_ds_read_b64_tr_b16(inst: irc.DS, ctx: _Ctx) -> UOp:
   """CDNA4 DS_READ_B64_TR_B16. This op has no pcode; within each 16-lane group it transposes four halfwords per lane.
 
-  Hardware-verified lane map: destination lane l, halfword n comes from source lane
+  Lane map: destination lane l, halfword n comes from source lane
   ((l & ~0xf) | ((l >> 2) & 3)) + 4*n, halfword l & 3.
   """
   exec_mask = ctx.rexec()

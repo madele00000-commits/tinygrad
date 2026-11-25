@@ -19,7 +19,7 @@ def _tr_elem(lane: int, elem: int) -> int:
   return ((lane & 15) + 3 * elem + (lane >> 4)) & 0xffff
 
 def _tr_expected() -> list[list[int]]:
-  """Hardware-verified lane map: lane l halfword n reads lane ((l & ~0xf) | ((l >> 2) & 3)) + 4*n, halfword l & 3."""
+  """Lane map: lane l halfword n reads lane ((l & ~0xf) | ((l >> 2) & 3)) + 4*n, halfword l & 3."""
   words = [[0] * 64 for _ in range(2)]
   for lane in range(64):
     for halfword in range(4):
