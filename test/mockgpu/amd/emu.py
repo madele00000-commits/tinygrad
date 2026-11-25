@@ -1865,7 +1865,7 @@ pm_render = PatternMatcher([
 ])
 
 @rewrite_group(replay="emu_process_replay")
-def lift(code:bytes, arch:str, renderer:Renderer, dispatch:tuple, name:str="") -> UOp:
+def lift(code:bytes, arch:str, renderer:Renderer, dispatch:tuple, name:str="", user_data_count:int=0) -> UOp:
   insts = amd_decode(code, arch)
   for inst in insts.values():
     inst_st = getattr(inst, "op_name", "").lower()
@@ -1916,7 +1916,8 @@ def lift(code:bytes, arch:str, renderer:Renderer, dispatch:tuple, name:str="") -
   consts = emu_consts(wave_sgpr, wave_size)
   gidx, gidy, gidz = wg%gx, (wg//gx)%gy, wg//(gx*gy)
   n_lanes = (total_threads-wave*wave_size).minimum(wave_size)
-  runtime_sgprs = [(0, args_ptr.cast(dtypes.uint32)), (1, (args_ptr>>32).cast(dtypes.uint32))]
+  if user_data_count: runtime_sgprs = [(i, UOp.variable(f"user_data_{i}", 0, dtypes.uint32.max, dtypes.uint32)) for i in range(user_data_count)]
+  else: runtime_sgprs = [(0, args_ptr.cast(dtypes.uint32)), (1, (args_ptr>>32).cast(dtypes.uint32))]
   if arch == "rdna4": runtime_sgprs += [(ttmp[7].offset, (gidy&0xFFFF)|((gidz&0xFFFF)<<16)), (ttmp[9].offset, gidx)]
   else:
     sgpr_id = (rsrc2 & hsa.AMD_COMPUTE_PGM_RSRC_TWO_USER_SGPR_COUNT) >> hsa.AMD_COMPUTE_PGM_RSRC_TWO_USER_SGPR_COUNT_SHIFT
@@ -1995,19 +1996,22 @@ RELIFT = ContextVar("RELIFT", 0) # lift and recompile to assembly N times
 REPLAY_EMU = ContextVar("REPLAY_EMU", 0)
 
 def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, lz: int, args_ptr: int, rsrc2: int = 0x19c,
-            scratch_size: int = 0, arch: str = "rdna3", name: str = "asm") -> int:
+            scratch_size: int = 0, arch: str = "rdna3", name: str = "asm", user_data: tuple[int, ...]|None = None) -> int:
   """Execute AMD assembly program. scratch_size is private_segment_fixed_size from kernel descriptor (per-lane)."""
   with Context(DEV=DEV.target('CPU', renderer='LLVM'), NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="",
                CAPTURE_PROCESS_REPLAY=REPLAY_EMU.value, DEFAULT_FLOAT="float32", DEFAULT_INT="int32", TRANSCENDENTAL=1):
     code = bytes(to_mv(lib, lib_sz))
+    user_data = tuple(user_data or ())
     dispatch = (gx, gy, gz, lx, ly, lz, rsrc2, scratch_size)
     renderer = Device['CPU'].renderer
-    if (key:=(code, arch, dispatch, name, type(renderer), renderer.target, *(x.value for x in to_program_config))) not in dispatch_cache:
-      dispatch_cache[key] = to_program(lift(code, arch, renderer, dispatch, f"emu {name}"), renderer)
+    key = (code, arch, dispatch, len(user_data), name, type(renderer), renderer.target, *(x.value for x in to_program_config))
+    if key not in dispatch_cache:
+      dispatch_cache[key] = to_program(lift(code, arch, renderer, dispatch, f"emu {name}", len(user_data)), renderer)
       relift_lib = code
       for relift_count in range(1, RELIFT.value+1):
         try:
-          ret = to_program(lift(relift_lib, arch, Device["AMD"].renderer, dispatch, f"relift_{relift_count} {name}"), Device["AMD"].renderer)
+          ret = to_program(lift(relift_lib, arch, Device["AMD"].renderer, dispatch, f"relift_{relift_count} {name}", len(user_data)),
+                           Device["AMD"].renderer)
         except Exception:
           print("relift err", traceback.format_exc())
           break
@@ -2015,8 +2019,9 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
     prg = dispatch_cache[key]
   vmem_buf = UOp.from_buffer(Buffer('CPU', 1 << 48, options=BufferSpec(external_ptr=0), opaque=0), dtypes.uint32)
   args = [vmem_buf] * (max(p.arg.slot for p in prg.kernel_params) + 1)
+  user_data_vals = {f"user_data_{i}": v for i, v in enumerate(user_data)}
   for p in prg.kernel_params:
-    if p.addrspace is AddrSpace.ALU: args[p.arg.slot] = p.bind(args_ptr)
+    if p.addrspace is AddrSpace.ALU: args[p.arg.slot] = p.bind(user_data_vals.get(p.arg.name or "", args_ptr))
   with _MXCSRContext():
     run_linear(UOp(Ops.LINEAR, src=(prg.call(*args),)), update_stats=False)
   return 0
